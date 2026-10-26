@@ -7,7 +7,7 @@ import random
 import logging
 import asyncio
 import argparse
-from quart import Quart, request, jsonify
+from quart import Quart, Response, request, jsonify
 from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
 
@@ -85,6 +85,7 @@ class TurnstileAPIServer:
         self.app = Quart(__name__)
         self.debug = debug
         self.results = self._load_results()
+        self.sites = self._load_sites()
         self.browser_type = browser_type
         self.headless = headless
         self.useragent = useragent
@@ -116,11 +117,39 @@ class TurnstileAPIServer:
         except IOError as e:
             logger.error(f"Error saving results to file: {str(e)}")
 
+    @staticmethod
+    def _load_sites():
+        """Load unique site URLs already stored in allsites.txt."""
+        sites = []
+        try:
+            if os.path.exists("allsites.txt"):
+                with open("allsites.txt", "r") as sites_file:
+                    for line in sites_file:
+                        site = line.strip()
+                        if site and site not in sites:
+                            sites.append(site)
+        except IOError as e:
+            logger.warning(f"Error loading sites: {str(e)}. Starting with an empty site list.")
+        return sites
+
+    def _record_site(self, url: str) -> None:
+        """Append a site URL once. Repeat visits are ignored."""
+        site = (url or "").strip()
+        if not site or site in self.sites:
+            return
+        self.sites.append(site)
+        try:
+            with open("allsites.txt", "a") as sites_file:
+                sites_file.write(site + "\n")
+        except IOError as e:
+            logger.error(f"Error saving site URL: {str(e)}")
+
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
+        self.app.route('/allsites.txt', methods=['GET'])(self.all_sites)
         self.app.route('/')(self.index)
 
     async def _startup(self) -> None:
@@ -255,6 +284,9 @@ class TurnstileAPIServer:
         action = request.args.get('action')
         cdata = request.args.get('cdata')
 
+        if url:
+            self._record_site(url)
+
         if not url or not sitekey:
             return jsonify({
                 "status": "error",
@@ -265,17 +297,38 @@ class TurnstileAPIServer:
         self.results[task_id] = "CAPTCHA_NOT_READY"
 
         try:
-            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
+            await self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata)
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")
-            return jsonify({"task_id": task_id}), 202
+            return self._result_response(task_id)
         except Exception as e:
             logger.error(f"Unexpected error processing request: {str(e)}")
             return jsonify({
                 "status": "error",
                 "error": str(e)
             }), 500
+
+    def _result_response(self, task_id: str):
+        """JSON body for one solved task, same fields written to results.json."""
+        result = self.results.get(task_id)
+
+        if result == "CAPTCHA_NOT_READY":
+            return jsonify({"task_id": task_id, "status": "CAPTCHA_NOT_READY"}), 202
+
+        if not isinstance(result, dict):
+            return jsonify({
+                "task_id": task_id,
+                "status": "error",
+                "error": "Captcha solve did not produce a result"
+            }), 500
+
+        status_code = 422 if result.get("value") == "CAPTCHA_FAIL" else 200
+        return jsonify({
+            "task_id": task_id,
+            "value": result.get("value"),
+            "elapsed_time": result.get("elapsed_time"),
+        }), status_code
 
     async def get_result(self):
         """Return solved data"""
@@ -284,13 +337,14 @@ class TurnstileAPIServer:
         if not task_id or task_id not in self.results:
             return jsonify({"status": "error", "error": "Invalid task ID/Request parameter"}), 400
 
-        result = self.results[task_id]
-        status_code = 200
+        return self._result_response(task_id)
 
-        if "CAPTCHA_FAIL" in result:
-            status_code = 422
-
-        return result, status_code
+    async def all_sites(self):
+        """Return the unique site URLs recorded from /turnstile."""
+        body = "\n".join(self.sites)
+        if body:
+            body += "\n"
+        return Response(body, mimetype="text/plain")
 
     @staticmethod
     async def index():
